@@ -3,10 +3,20 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import { dbQuery } from '../lib/db.js';
 import pkg from '@woocommerce/woocommerce-rest-api';
+
 const WooCommerceRestApi = pkg.default;
 
 function ts() { return new Date().toISOString(); }
 function log(...a) { console.log(ts(), ...a); }
+
+// Normaliza precios a string como espera WooCommerce.
+// Usa .toFixed(2) si manejas centavos.
+function money(v) {
+  if (v == null) return '';
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return n.toFixed(0); // cámbialo a 2 decimales si lo necesitas
+}
 
 const wc = new WooCommerceRestApi({
   url: process.env.WC_URL,
@@ -21,17 +31,31 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const hashRow = (r) =>
   crypto.createHash('sha256')
-    .update([r.PRECIO, r.EXISTENCIA, r.Estado].join('|'))
+    .update([r.PRECIO, r.PRECIO_DESC, r.EXISTENCIA, r.Estado].join('|'))
     .digest('hex');
 
-const toWoo = (r) => ({
-  sku: String(r.SKU),
-  name: r.NOM_PROD || String(r.SKU),
-  regular_price: String(r.PRECIO ?? ''),
-  manage_stock: true,
-  stock_quantity: Number(r.EXISTENCIA ?? 0),
-  status: r.Estado === 'A' ? 'publish' : 'draft',
-});
+// Genera el payload básico de producto para WooCommerce
+const toWoo = (r) => {
+  const regular = Number(r.PRECIO);
+  const discounted = Number(r.PRECIO_DESC);
+
+  const hasValidDiscount =
+    Number.isFinite(regular) &&
+    Number.isFinite(discounted) &&
+    discounted > 0 &&
+    discounted < regular;
+
+  return {
+    sku: String(r.SKU),
+    name: r.NOM_PROD || String(r.SKU),
+    regular_price: money(r.PRECIO),
+    // Para quitar descuento en Woo: mandar '' (o null).
+    sale_price: hasValidDiscount ? money(r.PRECIO_DESC) : '',
+    manage_stock: true,
+    stock_quantity: Number(r.EXISTENCIA ?? 0),
+    status: r.Estado === 'A' ? 'publish' : 'draft',
+  };
+};
 
 // -------- CATEGORÍAS (nuevo) --------
 // Cache por nombre (lowercase) -> { id, parent }
@@ -117,7 +141,7 @@ async function buildPayload(r) {
 async function fetchBatch(limit = 50) {
   log(`[DB] Leyendo lote de Master LIMIT ${limit}...`);
   const [rows] = await dbQuery(
-    `SELECT SKU, NOM_PROD, EXISTENCIA, PRECIO, Estado, Fecha, CATEGORIA, SUBCATEGORIA
+    `SELECT SKU, NOM_PROD, EXISTENCIA, PRECIO, PRECIO_DESC, Estado, Fecha, CATEGORIA, SUBCATEGORIA
      FROM Master
      WHERE CAMBIOS='S'
      ORDER BY Fecha ASC
@@ -186,7 +210,9 @@ async function wcBatch({ create = [], update = [] }) {
       const status = err?.response?.status;
       const body = err?.response?.data;
       const retriable = status === 429 || status >= 500;
-      log(`[WC] ERROR batch status=${status} retriable=${retriable} intento=${attempt} body=${JSON.stringify(body).slice(0,300)}`);
+      log(
+        `[WC] ERROR batch status=${status} retriable=${retriable} intento=${attempt} body=${JSON.stringify(body).slice(0,300)}`
+      );
       if (!retriable || attempt === MAX_ATTEMPTS) {
         throw new Error(`Woo batch failed status=${status} body=${JSON.stringify(body).slice(0,400)}`);
       }
@@ -282,7 +308,7 @@ async function cycle() {
   const creates = [];
   const updates = [];
   for (const r of toProcess) {
-    const payload = await buildPayload(r); // ⬅️ aquí añadimos categorías
+    const payload = await buildPayload(r); // ⬅️ aquí añadimos categorías y precios
     const id = skuToId.get(String(r.SKU));
     if (id) updates.push({ id, ...payload });
     else creates.push(payload);
@@ -327,5 +353,3 @@ async function cycle() {
     }
   }
 })();
-
-
